@@ -22,14 +22,14 @@ document.addEventListener('DOMContentLoaded', () => {
         themeToggle.addEventListener('click', toggleTheme);
     }
     
+    // Verificar estado del servidor al cargar
+    checkServerStatus();
+    
     // Verificar estado del servidor cada 30 segundos
     setInterval(checkServerStatus, 30000);
     
     // Añadir efectos de hover y focus a tarjetas
     addCardInteractivity();
-    
-    // Mostrar u ocultar elementos basados en el estado de conexión
-    updateUIBasedOnConnection();
 });
 
 /**
@@ -67,14 +67,82 @@ function updateThemeIcon(theme) {
  * Verificar el estado del servidor RPC
  */
 function checkServerStatus() {
+    console.log("Verificando estado del servidor...");
+    
+    // Usar /health primero, si falla usar /ping como respaldo
     fetch('/health')
         .then(response => response.json())
         .then(data => {
-            updateConnectionStatus(data.rpc_connected);
+            console.log("Respuesta de /health:", data);
+            
+            // Determinar el estado de conexión basado en diferentes formatos posibles
+            let isConnected = false;
+            
+            // Formato 1: { client_connected: true, server_running: true }
+            if (data.client_connected !== undefined && data.server_running !== undefined) {
+                isConnected = data.client_connected && data.server_running;
+            }
+            // Formato 2: { rpc_connected: true }
+            else if (data.rpc_connected !== undefined) {
+                isConnected = data.rpc_connected;
+            }
+            // Formato 3: { services: { client: "ok", server: "ok" } }
+            else if (data.services) {
+                isConnected = data.services.client === "ok" && data.services.server === "ok";
+            }
+            // Formato 4: { app: "ok" } - En este caso no tenemos información suficiente
+            else if (data.app === "ok") {
+                // Intentar obtener más información con /status
+                fetch('/status')
+                    .then(response => response.json())
+                    .then(statusData => {
+                        console.log("Respuesta de /status:", statusData);
+                        if (statusData.client && statusData.server) {
+                            updateConnectionStatus(
+                                statusData.client.connected && 
+                                statusData.server.running
+                            );
+                        } else {
+                            // No tenemos suficiente información, asumir conectado si la app está bien
+                            updateConnectionStatus(true);
+                        }
+                    })
+                    .catch(error => {
+                        console.error('Error verificando estado detallado:', error);
+                        // Asumir conectado si /health dice que la app está bien
+                        updateConnectionStatus(true);
+                    });
+                return;
+            }
+            
+            updateConnectionStatus(isConnected);
         })
         .catch(error => {
-            console.error('Error verificando estado:', error);
-            updateConnectionStatus(false);
+            console.error('Error verificando estado en /health:', error);
+            
+            // Intenta con /ping como alternativa
+            fetch('/ping')
+                .then(response => response.json())
+                .then(data => {
+                    console.log("Respuesta de /ping:", data);
+                    
+                    let isConnected = false;
+                    
+                    if (data.rpc_connected !== undefined) {
+                        isConnected = data.rpc_connected;
+                    } else if (data.services) {
+                        isConnected = data.services.client === "ok" && data.services.server === "ok";
+                    } else if (data.status === "ok") {
+                        // Si solo sabemos que el servidor está OK, asumimos que está conectado
+                        isConnected = true;
+                    }
+                    
+                    updateConnectionStatus(isConnected);
+                })
+                .catch(error => {
+                    console.error('Error verificando estado en /ping:', error);
+                    updateConnectionStatus(false);
+                });
         });
 }
 
@@ -83,6 +151,8 @@ function checkServerStatus() {
  * @param {boolean} connected - Estado de conexión 
  */
 function updateConnectionStatus(connected) {
+    console.log("Estado de conexión:", connected ? "Conectado" : "Desconectado");
+    
     const indicator = document.querySelector('.status-indicator');
     const statusText = document.querySelector('.status-indicator + div p');
     const processBtn = document.getElementById('process-btn');
@@ -93,12 +163,23 @@ function updateConnectionStatus(connected) {
             indicator.innerHTML = '<i class="bi bi-cloud-check"></i>';
             statusText.textContent = 'Conectado y funcionando';
             if (processBtn) processBtn.disabled = false;
+            
+            // Quitar alerta de advertencia si existe
+            const warningMsg = document.querySelector('#text-form .alert-warning');
+            if (warningMsg) {
+                warningMsg.remove();
+            }
         } else {
             indicator.className = 'status-indicator me-3 disconnected';
             indicator.innerHTML = '<i class="bi bi-cloud-slash"></i>';
             statusText.textContent = 'Desconectado';
             if (processBtn) processBtn.disabled = true;
+            
+            // Mostrar alerta si no existe
+            updateUIBasedOnConnection(false);
         }
+    } else {
+        console.warn("No se encontraron los elementos de indicador de estado");
     }
 }
 
@@ -129,24 +210,63 @@ function addCardInteractivity() {
 
 /**
  * Actualizar UI basado en estado de conexión
+ * @param {boolean} connected - Estado de conexión
  */
-function updateUIBasedOnConnection() {
-    const connected = document.querySelector('.status-indicator.connected') !== null;
+function updateUIBasedOnConnection(connected = null) {
+    // Si no se proporciona un valor, intentar determinarlo
+    if (connected === null) {
+        connected = document.querySelector('.status-indicator.connected') !== null;
+    }
+    
     const processBtn = document.getElementById('process-btn');
     
     if (processBtn) {
         processBtn.disabled = !connected;
     }
     
-    if (!connected) {
+    const form = document.getElementById('text-form');
+    const existingWarning = document.querySelector('#text-form .alert-warning');
+    
+    if (!connected && form && !existingWarning) {
         const warningMsg = document.createElement('div');
         warningMsg.className = 'alert alert-warning';
-        warningMsg.innerHTML = '<i class="bi bi-exclamation-triangle"></i> Servidor RPC no disponible. Por favor verifica la conexión.';
+        warningMsg.innerHTML = '<i class="bi bi-exclamation-triangle"></i> Servidor RPC no disponible. Por favor verifica la conexión. <button id="reconnect-btn" class="btn btn-sm btn-warning ms-2">Reconectar</button>';
         
-        const form = document.getElementById('text-form');
-        if (form && !document.querySelector('#text-form .alert')) {
-            form.prepend(warningMsg);
-        }
+        form.prepend(warningMsg);
+        
+        // Añadir evento al botón de reconexión
+        document.getElementById('reconnect-btn').addEventListener('click', function() {
+            this.disabled = true;
+            this.innerHTML = '<span class="spinner-border spinner-border-sm" role="status" aria-hidden="true"></span> Reconectando...';
+            
+            fetch('/restart', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                }
+            })
+            .then(response => response.json())
+            .then(data => {
+                this.innerHTML = 'Reconectar';
+                this.disabled = false;
+                
+                if (data.status === 'success') {
+                    // Esperar un momento y verificar el estado
+                    setTimeout(checkServerStatus, 2000);
+                } else {
+                    console.error('Error al reconectar:', data.message);
+                    alert('Error al reconectar: ' + data.message);
+                }
+            })
+            .catch(error => {
+                console.error('Error:', error);
+                this.innerHTML = 'Reconectar';
+                this.disabled = false;
+                alert('Error al reconectar: ' + error);
+            });
+        });
+    } else if (connected && existingWarning) {
+        existingWarning.remove();
     }
 }
 
@@ -198,6 +318,8 @@ function copyToClipboard(text, button) {
  */
 function animateOnScroll() {
     const elementsToAnimate = document.querySelectorAll('.animate-on-scroll');
+    
+    if (elementsToAnimate.length === 0) return;
     
     const observer = new IntersectionObserver((entries) => {
         entries.forEach(entry => {

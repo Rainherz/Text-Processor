@@ -1,118 +1,286 @@
-"""
-This is a simple example on how to use Flask and Asynchronous RPC calls.
-
-I kept this simple, but if you want to use this properly you will need
-to expand the concept.
-
-Things that are not included in this example.
-    - Reconnection strategy.
-
-    - Consider implementing utility functionality for checking and getting
-      responses.
-
-        def has_response(correlation_id)
-        def get_response(correlation_id)
-
-Apache/wsgi configuration.
-    - Each process you start with apache will create a new connection to
-      RabbitMQ.
-
-    - I would recommend depending on the size of the payload that you have
-      about 100 threads per process. If the payload is larger, it might be
-      worth to keep a lower thread count per process.
-
-For questions feel free to email me: me@eandersson.net
-"""
-__author__ = 'eandersson'
-
 import threading
-from time import sleep
-
-from flask import Flask
-
+import time
+import os
+import datetime
+import json
+from urllib.parse import urlparse
 import amqpstorm
 from amqpstorm import Message
+import logging
 
-app = Flask(__name__)
+# Configurar logging
+logging.basicConfig(level=logging.INFO, 
+                   format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger("cliente")
 
+# Configuración de CloudAMQP
+CLOUDAMQP_URL = os.environ.get('CLOUDAMQP_URL', 'amqps://tnluigbk:x9gWN83qzJ3CIZjiKKAyg327wKNb9eA1@porpoise.rmq.cloudamqp.com/tnluigbk')
+url = urlparse(CLOUDAMQP_URL)
 
+# Extraer componentes de la URL
+RABBIT_HOST = url.hostname
+RABBIT_USER = url.username
+RABBIT_PASSWORD = url.password
+RABBIT_VHOST = url.path[1:] if url.path else '%2f'
+RABBIT_PORT = 5671  # Puerto para TLS
+RABBIT_SSL = True   # Habilitar SSL para conexión segura
+RPC_QUEUE = 'rpc_queue'
+HEARTBEAT_INTERVAL = 30  # Reducir el intervalo de heartbeat a 30 segundos
+
+# Estado global
+CLIENT_STATUS = {
+    "connected": False,
+    "processed_messages": 0,
+    "errors": 0,
+    "last_error": None,
+    "last_reconnect": None
+}
+
+# Clase de Cliente RPC mejorada
 class RpcClient(object):
-    """Asynchronous Rpc client."""
-
-    def __init__(self, host, username, password, rpc_queue):
+    def __init__(self, host, username, password, rpc_queue, vhost, port=5671, ssl=True, heartbeat=30):
         self.queue = {}
         self.host = host
         self.username = username
         self.password = password
+        self.vhost = vhost
+        self.port = port
+        self.ssl = ssl
+        self.heartbeat = heartbeat
         self.channel = None
         self.connection = None
         self.callback_queue = None
         self.rpc_queue = rpc_queue
+        self.consumer_thread = None
+        self.heartbeat_thread = None
+        self.should_reconnect = True
         self.open()
 
     def open(self):
-        """Open Connection."""
-        self.connection = amqpstorm.Connection(self.host, self.username,
-                                               self.password)
-        self.channel = self.connection.channel()
-        self.channel.queue.declare(self.rpc_queue)
-        result = self.channel.queue.declare(exclusive=True)
-        self.callback_queue = result['queue']
-        self.channel.basic.consume(self._on_response, no_ack=True,
-                                   queue=self.callback_queue)
-        self._create_process_thread()
+        """Abrir conexión con manejo de errores y reconexión"""
+        if self.connection and self.connection.is_open:
+            return True
+        
+        try:
+            logger.info(f"Conectando a RabbitMQ: {self.host}:{self.port}")
+            # Configurar conexión con tiempo de heartbeat reducido
+            self.connection = amqpstorm.Connection(
+                self.host, 
+                self.username,
+                self.password,
+                virtual_host=self.vhost,
+                port=self.port,
+                ssl=self.ssl,
+                heartbeat=self.heartbeat
+            )
+            
+            self.channel = self.connection.channel()
+            # Asegurar que la cola RPC exista
+            self.channel.queue.declare(self.rpc_queue)
+            
+            # Crear cola de respuestas exclusiva
+            result = self.channel.queue.declare(exclusive=True)
+            self.callback_queue = result['queue']
+            
+            # Configurar consumidor
+            self.channel.basic.consume(self._on_response, no_ack=True,
+                                      queue=self.callback_queue)
+            
+            # Iniciar hilo de consumo
+            self._create_process_thread()
+            
+            # Iniciar hilo de heartbeat
+            self._create_heartbeat_thread()
+            
+            logger.info("Conectado exitosamente a RabbitMQ")
+            CLIENT_STATUS["connected"] = True
+            CLIENT_STATUS["last_reconnect"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            
+            return True
+        except Exception as e:
+            CLIENT_STATUS["connected"] = False
+            CLIENT_STATUS["errors"] += 1
+            CLIENT_STATUS["last_error"] = str(e)
+            logger.error(f"Error al conectar con RabbitMQ: {str(e)}")
+            return False
 
     def _create_process_thread(self):
-        """Create a thread responsible for consuming messages in response
-         to RPC requests.
-        """
-        thread = threading.Thread(target=self._process_data_events)
-        thread.setDaemon(True)
-        thread.start()
+        """Crear hilo para procesar mensajes"""
+        if self.consumer_thread and self.consumer_thread.is_alive():
+            return
+            
+        self.consumer_thread = threading.Thread(target=self._process_data_events)
+        self.consumer_thread.daemon = True
+        self.consumer_thread.start()
+
+    def _create_heartbeat_thread(self):
+        """Crear hilo para enviar heartbeats"""
+        if self.heartbeat_thread and self.heartbeat_thread.is_alive():
+            return
+            
+        self.heartbeat_thread = threading.Thread(target=self._heartbeat_loop)
+        self.heartbeat_thread.daemon = True
+        self.heartbeat_thread.start()
 
     def _process_data_events(self):
-        """Process Data Events using the Process Thread."""
-        self.channel.start_consuming(to_tuple=False)
+        """Procesar eventos con manejo de errores y reconexión"""
+        while self.should_reconnect:
+            try:
+                if self.connection and self.connection.is_open:
+                    self.channel.start_consuming(to_tuple=False)
+            except Exception as e:
+                CLIENT_STATUS["errors"] += 1
+                CLIENT_STATUS["last_error"] = str(e)
+                logger.error(f"Error en hilo de consumo: {str(e)}")
+                CLIENT_STATUS["connected"] = False
+                
+                # Intentar reconectar
+                time.sleep(5)  # Esperar antes de reconectar
+                self._reconnect()
+
+    def _heartbeat_loop(self):
+        """Mantener la conexión viva enviando un comando liviano periódicamente"""
+        while self.should_reconnect:
+            try:
+                if self.connection and self.connection.is_open:
+                    # En lugar de send_heartbeat(), usamos un comando liviano
+                    # para mantener la conexión activa
+                    self.channel.basic.publish(
+                        body='',
+                        exchange='',
+                        routing_key='',
+                        properties={
+                            'delivery_mode': 1  # No persistente
+                        }
+                    )
+            except Exception as e:
+                CLIENT_STATUS["errors"] += 1
+                CLIENT_STATUS["last_error"] = f"Heartbeat error: {str(e)}"
+                logger.error(f"Error en heartbeat: {str(e)}")
+                
+                # Intentar reconectar si el error es de conexión
+                if self.connection and not self.connection.is_open:
+                    self._reconnect()
+                
+            # Dormir por menos tiempo que el intervalo de heartbeat
+            time.sleep(self.heartbeat // 2)
+
+    def _reconnect(self):
+        """Intentar reconectar al servidor RabbitMQ"""
+        if not self.should_reconnect:
+            return
+            
+        logger.info("Intentando reconectar...")
+        
+        # Cerrar conexiones existentes
+        try:
+            if self.connection:
+                self.connection.close()
+        except:
+            pass
+            
+        # Intentar reconectar
+        self.open()
 
     def _on_response(self, message):
-        """On Response store the message with the correlation id in a local
-         dictionary.
-        """
-        self.queue[message.correlation_id] = message.body
+        """Manejar respuestas"""
+        try:
+            self.queue[message.correlation_id] = message.body
+        except Exception as e:
+            CLIENT_STATUS["errors"] += 1
+            CLIENT_STATUS["last_error"] = str(e)
+            logger.error(f"Error en manejador de respuestas: {str(e)}")
 
     def send_request(self, payload):
-        # Create the Message object.
-        message = Message.create(self.channel, payload)
-        message.reply_to = self.callback_queue
+        """Enviar solicitud con manejo de errores"""
+        try:
+            # Verificar y reconectar si es necesario
+            if not self.connection or not self.connection.is_open:
+                if not self.open():
+                    return None
+                    
+            # Crear mensaje
+            message = Message.create(self.channel, payload)
+            message.reply_to = self.callback_queue
+            
+            # Crear entrada en diccionario
+            self.queue[message.correlation_id] = None
+            
+            # Publicar solicitud
+            message.publish(routing_key=self.rpc_queue)
+            
+            return message.correlation_id
+        except Exception as e:
+            CLIENT_STATUS["errors"] += 1
+            CLIENT_STATUS["last_error"] = str(e)
+            logger.error(f"Error al enviar solicitud: {str(e)}")
+            
+            # Intentar reconectar
+            self._reconnect()
+            return None
 
-        # Create an entry in our local dictionary, using the automatically
-        # generated correlation_id as our key.
-        self.queue[message.correlation_id] = None
+    def is_connected(self):
+        """Verificar conexión"""
+        return self.connection and self.connection.is_open
 
-        # Publish the RPC request.
-        message.publish(routing_key=self.rpc_queue)
+    def close(self):
+        """Cerrar conexión"""
+        self.should_reconnect = False
+        if self.connection:
+            try:
+                self.connection.close()
+            except:
+                pass
+        CLIENT_STATUS["connected"] = False
 
-        # Return the Unique ID used to identify the request.
-        return message.correlation_id
+# Variable global para el cliente RPC
+RPC_CLIENT = None
 
-    @app.route('/procesar/<comando>/<texto>')
-    def procesar_texto(comando, texto):
-
-        """Ruta Flask para procesamiento de texto."""
-        # Formatear el payload como "comando:texto"
-        payload = f"{comando}:{texto}"
-        
-        # Enviar la solicitud y almacenar el ID único
-        corr_id = RPC_CLIENT.send_request(payload)
-        
-        # Esperar hasta recibir una respuesta
-        while RPC_CLIENT.queue[corr_id] is None:
-            sleep(0.1)
-        
-        # Devolver la respuesta al usuario
-        return RPC_CLIENT.queue[corr_id]
+def init_client():
+    """Inicializar cliente RPC"""
+    global RPC_CLIENT
     
+    logger.info("Iniciando cliente RPC...")
+    
+    # Si ya existe una instancia, cerrarla primero
+    if RPC_CLIENT:
+        try:
+            RPC_CLIENT.close()
+        except:
+            pass
+    
+    # Crear nueva instancia
+    RPC_CLIENT = RpcClient(
+        RABBIT_HOST, 
+        RABBIT_USER, 
+        RABBIT_PASSWORD, 
+        RPC_QUEUE, 
+        RABBIT_VHOST,
+        RABBIT_PORT,
+        RABBIT_SSL,
+        HEARTBEAT_INTERVAL
+    )
+    
+    logger.info(f"Cliente RPC inicializado. Conectado: {RPC_CLIENT.is_connected()}")
+    return RPC_CLIENT.is_connected()
 
-if __name__ == '__main__':
-    RPC_CLIENT = RpcClient('127.0.0.1', 'guest', 'guest', 'rpc_queue')
-    app.run()
+def get_client_status():
+    """Obtener estado del cliente"""
+    if RPC_CLIENT:
+        CLIENT_STATUS["connected"] = RPC_CLIENT.is_connected()
+    
+    return CLIENT_STATUS
+
+# Si se ejecuta directamente, iniciar cliente
+if __name__ == "__main__":
+    init_client()
+    
+    # Mantener proceso vivo
+    try:
+        while True:
+            time.sleep(10)
+            logger.info(f"Cliente activo. Estado: {get_client_status()}")
+    except KeyboardInterrupt:
+        logger.info("Deteniendo cliente...")
+        if RPC_CLIENT:
+            RPC_CLIENT.close()

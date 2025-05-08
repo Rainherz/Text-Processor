@@ -60,7 +60,16 @@ def process_text():
     if not operation or not text:
         flash('Por favor, completa todos los campos', 'danger')
         return redirect(url_for('index'))
-    
+
+   # Verificar si RPC_CLIENT es None, e intentar inicializarlo si es necesario
+    global RPC_CLIENT
+    if RPC_CLIENT is None:
+        # Intentar inicializar el cliente
+        init_client()
+        # Verificar nuevamente
+        from cliente import RPC_CLIENT as fresh_client
+        RPC_CLIENT = fresh_client
+
     # Verificar conexión
     if not RPC_CLIENT or not RPC_CLIENT.is_connected():
         # Intentar reconectar

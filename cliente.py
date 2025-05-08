@@ -233,6 +233,13 @@ class RpcClient(object):
                 pass
         CLIENT_STATUS["connected"] = False
 
+def get_rpc_client():
+    """Obtener el cliente RPC, inicializándolo si es necesario"""
+    global RPC_CLIENT
+    if RPC_CLIENT is None or not RPC_CLIENT.is_connected():
+        init_client()
+    return RPC_CLIENT
+
 # Variable global para el cliente RPC
 RPC_CLIENT = None
 
